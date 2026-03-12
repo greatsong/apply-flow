@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "apply-flow",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["http-server", "/Users/greatsong/greatsong-project/apply-flow", "-p", "4020", "-c-1"],
+      "port": 4020
+    }
+  ]
+}
