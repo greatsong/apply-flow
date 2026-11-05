@@ -18,13 +18,43 @@
 function doPost(e) {
   try {
     const data = JSON.parse(e.postData.contents);
-    const action = data.action;
+    // 관리 화면은 ?action=... 에 담아 보내고, 신청 화면은 본문에 담아 보낸다.
+    const action = data.action || (e.parameter && e.parameter.action);
     let result;
 
     switch (action) {
       case 'submit':
         // 신청서 제출 (인증 불필요)
         result = saveApplication(data);
+        break;
+
+      case 'verifyAdmin':
+        // 관리자 로그인 확인. 비밀번호가 주소에 남지 않도록 POST로만 받는다.
+        if (loginLocked_()) {
+          result = { success: false, message: '로그인 시도가 많아 잠겼습니다. 10분 뒤 다시 시도해 주세요.' };
+          break;
+        }
+        result = verifyPassword(data.password)
+          ? { success: true }
+          : { success: false, message: '비밀번호가 올바르지 않습니다.' };
+        break;
+
+      case 'getApplications':
+        // 전체 신청 목록 (관리자 전용). 개인정보가 포함되므로 POST로만 받는다.
+        if (!verifyPassword(data.password)) {
+          result = { success: false, error: '인증 실패' };
+          break;
+        }
+        result = getApplications();
+        break;
+
+      case 'getReviews':
+        // 전체 심사 결과 (관리자 전용)
+        if (!verifyPassword(data.password)) {
+          result = { success: false, error: '인증 실패' };
+          break;
+        }
+        result = getReviews();
         break;
 
       case 'chat':
@@ -115,24 +145,8 @@ function doGet(e) {
         result = getConfig();
         break;
 
-      case 'getApplications':
-        // 전체 신청 목록 (관리자 전용)
-        if (!verifyPassword(e.parameter.password)) {
-          result = { success: false, error: '인증 실패' };
-          break;
-        }
-        result = getApplications();
-        break;
-
-      case 'getReviews':
-        // 전체 심사 결과 (관리자 전용)
-        if (!verifyPassword(e.parameter.password)) {
-          result = { success: false, error: '인증 실패' };
-          break;
-        }
-        result = getReviews();
-        break;
-
+      // getApplications·getReviews는 GET으로 받지 않는다.
+      // 비밀번호가 주소에 실려 방문 기록과 서버 기록에 남기 때문이다.
       default:
         result = { success: false, error: '알 수 없는 액션: ' + action };
     }
@@ -147,6 +161,45 @@ function doGet(e) {
       .createTextOutput(JSON.stringify(errorResult))
       .setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+// ============================================================
+// 입력 정리
+// ============================================================
+
+// 신청서 항목별 최대 글자 수. 구글 시트 한 칸의 한계(5만 자)보다 작게 둔다.
+var FIELD_LIMITS = {
+  name: 50, email: 120, school: 100, subject: 60,
+  topic: 300, expertise: 5000, outline: 10000, sample: 40000
+};
+
+// 공개 접수 창구의 1분당 처리 건수. 연속 제출로 시트와 실행 할당량을 소진하는 것을 막는다.
+var SUBMIT_PER_MINUTE = 30;
+
+/**
+ * 시트에 쓰는 글자를 문자로 고정한다.
+ * =, +, -, @로 시작하면 시트가 수식으로 실행해 다른 지원자의 칸을 읽을 수 있으므로 작은따옴표를 앞에 붙인다.
+ */
+function sheetText_(value, max) {
+  var text = String(value == null ? '' : value).slice(0, max);
+  return /^[=+\-@\t\r\n]/.test(text) ? "'" + text : text;
+}
+
+/** 이메일 본문(HTML)에 넣는 값의 특수문자를 바꾼다. 지원자가 적은 글이 메일 안에서 태그로 동작하지 않게 한다. */
+function escapeHtml_(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** 접수 창구 분당 제한. 넘으면 false를 돌려준다. */
+function allowSubmit_() {
+  var cache = CacheService.getScriptCache();
+  var key = 'submit_' + Math.floor(Date.now() / 60000);
+  var used = Number(cache.get(key) || 0);
+  if (used >= SUBMIT_PER_MINUTE) return false;
+  cache.put(key, String(used + 1), 120);
+  return true;
 }
 
 // ============================================================
@@ -166,6 +219,18 @@ function saveApplication(data) {
       return { success: false, error: '"신청" 시트를 찾을 수 없습니다.' };
     }
 
+    if (!allowSubmit_()) {
+      return { success: false, error: '잠시 뒤 다시 제출해 주세요.' };
+    }
+
+    // 모집을 닫았으면 서버에서도 받지 않는다. 화면만 닫으면 주소를 아는 사람은 계속 제출할 수 있다.
+    if (getConfigInternal()['form_open'] === false) {
+      return { success: false, error: '모집이 마감되었습니다.' };
+    }
+
+    // 신청 화면은 { action, data: {...} } 형태로 보낸다.
+    const form = data.data || data;
+
     // 자동 ID 생성 (APP-001, APP-002, ...)
     const lastRow = sheet.getLastRow();
     let newId = 'APP-001';
@@ -179,14 +244,14 @@ function saveApplication(data) {
     const row = [
       newId,
       timestamp,
-      data.name || '',
-      data.email || '',
-      data.school || '',
-      data.subject || '',
-      data.topic || '',
-      data.expertise || '',
-      data.outline || '',
-      data.sample || '',
+      sheetText_(form.name, FIELD_LIMITS.name),
+      sheetText_(form.email, FIELD_LIMITS.email),
+      sheetText_(form.school, FIELD_LIMITS.school),
+      sheetText_(form.subject, FIELD_LIMITS.subject),
+      sheetText_(form.topic, FIELD_LIMITS.topic),
+      sheetText_(form.expertise, FIELD_LIMITS.expertise),
+      sheetText_(form.outline, FIELD_LIMITS.outline),
+      sheetText_(form.sample, FIELD_LIMITS.sample),
       'pending',   // status
       false         // email_sent
     ];
@@ -335,17 +400,32 @@ function chatWithAI(messages, systemPrompt) {
 }
 
 /**
+ * 자유 서술 칸에 지원자가 직접 적은 식별 정보를 가린다.
+ * 본인의 이름·소속·이메일과 이메일·전화번호 형태를 찾는다. 찾지 못한 표현은 남을 수 있다.
+ */
+function redactIdentity_(text, applicationRow) {
+  var out = String(text == null ? '' : text);
+  [applicationRow.name, applicationRow.school, applicationRow.email].forEach(function(value) {
+    var word = String(value == null ? '' : value).trim();
+    if (word.length >= 2) out = out.split(word).join('[가림]');
+  });
+  return out
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[가림]')
+    .replace(/0\d{1,2}[-. ]?\d{3,4}[-. ]?\d{4}/g, '[가림]');
+}
+
+/**
  * 블라인드 데이터 생성
  * 개인정보(이름, 이메일, 학교, 과목)를 제거하고 콘텐츠 필드만 반환
- * AI가 절대 개인정보를 볼 수 없도록 함
+ * 자유 서술 칸에 적힌 본인 식별 정보도 서버에서 가린 뒤 AI에 보낸다
  */
 function getBlindData(applicationRow, anonymousId) {
   return {
     id: anonymousId || '지원자',
-    topic: applicationRow.topic || applicationRow['topic'] || '',
-    expertise: applicationRow.expertise || applicationRow['expertise'] || '',
-    outline: applicationRow.outline || applicationRow['outline'] || '',
-    sample: applicationRow.sample || applicationRow['sample'] || ''
+    topic: redactIdentity_(applicationRow.topic, applicationRow),
+    expertise: redactIdentity_(applicationRow.expertise, applicationRow),
+    outline: redactIdentity_(applicationRow.outline, applicationRow),
+    sample: redactIdentity_(applicationRow.sample, applicationRow)
   };
 }
 
@@ -698,14 +778,14 @@ function sendResultEmail(applicationId, type) {
     var subject, body;
 
     if (type === 'accepted') {
-      subject = (config['email_accepted_subject'] || '[EduFlow] 베타 테스터 선정 안내').replace('{{name}}', application.name);
+      subject = (config['email_accepted_subject'] || '[EduFlow] 베타 테스터 선정 안내').replace('{{name}}', function() { return application.name; });
       var template = config['email_accepted_body'] || getDefaultAcceptedTemplate();
-      body = template.replace(/\{\{name\}\}/g, application.name)
-                     .replace(/\{\{topic\}\}/g, application.topic);
+      body = template.replace(/\{\{name\}\}/g, function() { return escapeHtml_(application.name); })
+                     .replace(/\{\{topic\}\}/g, function() { return escapeHtml_(application.topic); });
     } else {
-      subject = (config['email_rejected_subject'] || '[EduFlow] 베타 테스터 심사 결과 안내').replace('{{name}}', application.name);
+      subject = (config['email_rejected_subject'] || '[EduFlow] 베타 테스터 심사 결과 안내').replace('{{name}}', function() { return application.name; });
       var template = config['email_rejected_body'] || getDefaultRejectedTemplate();
-      body = template.replace(/\{\{name\}\}/g, application.name);
+      body = template.replace(/\{\{name\}\}/g, function() { return escapeHtml_(application.name); });
     }
 
     // 이메일 발송
@@ -838,16 +918,23 @@ function saveConfig(config) {
   }
 }
 
+// 인증 없이 내려줄 수 있는 설정. 새 항목은 여기에 적어야 공개된다.
+var PUBLIC_CONFIG_KEYS = [
+  'form_title', 'form_description', 'form_open', 'form_deadline',
+  'title', 'description', 'deadline', 'steps', 'confirmedQuestions'
+];
+
 /**
- * 설정 조회 (공개용 - 비밀번호, API 키 제외)
+ * 설정 조회 (공개용). 정해 둔 항목만 내려준다.
+ * 이메일 양식·심사 기준처럼 나중에 시트에 더한 값이 그대로 공개되지 않게 한다.
  */
 function getConfig() {
   try {
-    var config = getConfigInternal();
-
-    // 민감 정보 제거
-    delete config['admin_password_hash'];
-    delete config['ANTHROPIC_API_KEY'];
+    var internal = getConfigInternal();
+    var config = {};
+    PUBLIC_CONFIG_KEYS.forEach(function(key) {
+      if (key in internal) config[key] = internal[key];
+    });
 
     return { success: true, config: config };
   } catch (error) {
@@ -893,6 +980,11 @@ function getConfigInternal() {
 // 인증 헬퍼
 // ============================================================
 
+/** 비밀번호를 10분에 10번 틀렸는지 확인한다. Apps Script는 접속자 IP를 알 수 없어 전체 공용으로 센다. */
+function loginLocked_() {
+  return Number(CacheService.getScriptCache().get('auth_failed') || 0) >= 10;
+}
+
 /**
  * 비밀번호 검증
  * SHA-256 해시로 비교
@@ -901,12 +993,16 @@ function verifyPassword(password) {
   if (!password) return false;
 
   try {
-    var config = getConfigInternal();
-    var storedHash = config['admin_password_hash'];
+    // 공개 주소로 비밀번호를 계속 대입해 보는 시도를 막는다. 10분에 10번 틀리면 10분 동안 잠긴다.
+    if (loginLocked_()) return false;
+    var cache = CacheService.getScriptCache();
+    var failed = Number(cache.get('auth_failed') || 0);
+
+    // Script Properties를 먼저 본다. 시트 값은 예전 설치와의 호환을 위해서만 읽는다.
+    var storedHash = PropertiesService.getScriptProperties().getProperty('ADMIN_PASSWORD_HASH');
 
     if (!storedHash) {
-      // 해시가 없으면 Script Properties에서도 확인
-      storedHash = PropertiesService.getScriptProperties().getProperty('ADMIN_PASSWORD_HASH');
+      storedHash = getConfigInternal()['admin_password_hash'];
     }
 
     if (!storedHash) return false;
@@ -914,7 +1010,12 @@ function verifyPassword(password) {
     // SHA-256 해시 계산
     var inputHash = hashPassword(password);
 
-    return inputHash === storedHash;
+    if (inputHash === storedHash) {
+      cache.remove('auth_failed');
+      return true;
+    }
+    cache.put('auth_failed', String(failed + 1), 600);
+    return false;
   } catch (error) {
     Logger.log('비밀번호 검증 오류: ' + error.message);
     return false;
@@ -1015,26 +1116,25 @@ function initialSetup() {
   Logger.log('초기 셋업 완료!');
   Logger.log('다음 단계:');
   Logger.log('1. Script Properties에 ANTHROPIC_API_KEY 설정');
-  Logger.log('2. "설정" 시트에 admin_password_hash 추가 (또는 Script Properties에 ADMIN_PASSWORD_HASH 설정)');
+  Logger.log('2. 스크립트 편집기에서 setAdminPassword 실행 (비밀번호 해시는 Script Properties에 저장됩니다)');
   Logger.log('3. 웹 앱으로 배포 (실행 대상: 나, 액세스: 모든 사용자)');
 
   return '초기 셋업 완료';
 }
 
 /**
- * 관리자 비밀번호 해시 생성 헬퍼
- * 스크립트 에디터에서 직접 실행하여 해시값 확인
- * 예: setAdminPassword('mypassword123')
+ * 관리자 비밀번호 저장 헬퍼
+ * 스크립트 에디터에서 직접 실행한다. 예: setAdminPassword('긴 문장형 비밀번호')
+ * 해시는 시트가 아니라 Script Properties에 둔다. 시트를 공유해도 해시가 함께 나가지 않는다.
  */
 function setAdminPassword(password) {
-  var hash = hashPassword(password);
-  Logger.log('비밀번호 해시: ' + hash);
-  Logger.log('이 값을 "설정" 시트의 admin_password_hash 행에 입력하세요.');
+  PropertiesService.getScriptProperties().setProperty('ADMIN_PASSWORD_HASH', hashPassword(password));
 
-  // 설정 시트에 자동 저장
+  // 예전 설치의 시트 값은 지운다
   var config = getConfigInternal();
-  config['admin_password_hash'] = hash;
-  saveConfig(config);
-
-  return hash;
+  if ('admin_password_hash' in config) {
+    delete config['admin_password_hash'];
+    saveConfig(config);
+  }
+  Logger.log('관리자 비밀번호를 Script Properties에 저장했습니다.');
 }
