@@ -10,12 +10,16 @@
 // Google Apps Script 웹 앱 URL — localStorage에서 불러오거나 빈 문자열
 let APPS_SCRIPT_URL = localStorage.getItem('applyflow_apps_script_url') || '';
 
+// 관리자 비밀번호는 브라우저를 닫으면 사라지는 sessionStorage에만 둔다.
+// 예전 버전이 localStorage에 남긴 값은 지운다.
+localStorage.removeItem('applyflow_admin_pw');
+
 // ============================================
 // 상태
 // ============================================
 
 const adminState = {
-  password: localStorage.getItem('applyflow_admin_pw') || '',
+  password: sessionStorage.getItem('applyflow_admin_pw') || '',
   applications: [],
   reviews: [],
   config: null,
@@ -118,8 +122,12 @@ async function login() {
 
   try {
     if (APPS_SCRIPT_URL) {
-      // Apps Script에서 비밀번호 확인
-      const res = await fetch(`${APPS_SCRIPT_URL}?action=verifyAdmin&password=${encodeURIComponent(password)}`);
+      // Apps Script에서 비밀번호 확인. 비밀번호가 주소에 남지 않도록 본문으로 보낸다.
+      const res = await fetch(`${APPS_SCRIPT_URL}?action=verifyAdmin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ password })
+      });
       const data = await res.json();
 
       if (!data.success) {
@@ -132,23 +140,21 @@ async function login() {
 
     // 비밀번호 저장 및 UI 전환
     adminState.password = password;
-    localStorage.setItem('applyflow_admin_pw', password);
+    sessionStorage.setItem('applyflow_admin_pw', password);
     btn.classList.remove('loading');
     showMainUI();
   } catch (error) {
+    // 서버 확인에 실패하면 들어가지 않는다
     console.error('로그인 실패:', error);
-    // 오프라인 모드 — 일단 진입 허용
-    adminState.password = password;
-    localStorage.setItem('applyflow_admin_pw', password);
+    errorEl.textContent = '서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요.';
+    errorEl.style.display = 'block';
     btn.classList.remove('loading');
-    showMainUI();
-    showToast('서버 연결 없이 오프라인 모드로 진입합니다.');
   }
 }
 
 function logout() {
   adminState.password = '';
-  localStorage.removeItem('applyflow_admin_pw');
+  sessionStorage.removeItem('applyflow_admin_pw');
   document.getElementById('adminMain').style.display = 'none';
   document.getElementById('loginModal').classList.remove('hidden');
   document.getElementById('adminPassword').value = '';
@@ -431,7 +437,11 @@ async function loadApplications() {
   `;
 
   try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=getApplications&password=${encodeURIComponent(adminState.password)}`);
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=getApplications`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ password: adminState.password })
+    });
     const data = await res.json();
 
     if (data.success) {
@@ -443,7 +453,7 @@ async function loadApplications() {
       tbody.innerHTML = `
         <tr>
           <td colspan="8" style="text-align: center; padding: 40px; color: var(--coral);">
-            데이터 로드 실패: ${data.message || '알 수 없는 오류'}
+            데이터 로드 실패: ${escapeHtml(data.message || data.error || '알 수 없는 오류')}
           </td>
         </tr>
       `;
@@ -759,7 +769,11 @@ async function loadReviews() {
   if (!APPS_SCRIPT_URL) return;
 
   try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=getReviews&password=${encodeURIComponent(adminState.password)}`);
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=getReviews`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ password: adminState.password })
+    });
     const data = await res.json();
 
     if (data.success && data.reviews) {
@@ -1133,7 +1147,7 @@ function saveSettings() {
 
   if (newPassword) {
     adminState.password = newPassword;
-    localStorage.setItem('applyflow_admin_pw', newPassword);
+    sessionStorage.setItem('applyflow_admin_pw', newPassword);
     showToast('비밀번호가 변경되었습니다.');
   }
 
