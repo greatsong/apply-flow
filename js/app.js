@@ -499,8 +499,7 @@ async function handleSubmit() {
     if (APPS_SCRIPT_URL) {
       const res = await fetch(APPS_SCRIPT_URL, {
         method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
           action: 'submit',
           data: state.formData,
@@ -508,7 +507,13 @@ async function handleSubmit() {
         })
       });
 
-      // no-cors 모드에서는 응답을 읽을 수 없으므로 성공으로 간주
+      // 서버가 거절한 제출(마감, 접수 제한)을 성공으로 표시하지 않도록 응답을 확인한다
+      const result = await res.json();
+      if (!result.success) {
+        const rejected = new Error('rejected');
+        rejected.serverMessage = result.error;
+        throw rejected;
+      }
     } else {
       // Apps Script URL 미설정 시 콘솔 출력
       console.log('제출 데이터:', state.formData);
@@ -521,7 +526,7 @@ async function handleSubmit() {
     console.error('제출 실패:', error);
     btn.disabled = false;
     btn.innerHTML = '제출하기';
-    showToast('제출에 실패했습니다. 다시 시도해 주세요.');
+    showToast(error.serverMessage || '제출에 실패했습니다. 다시 시도해 주세요.');
   }
 }
 

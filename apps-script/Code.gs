@@ -30,6 +30,10 @@ function doPost(e) {
 
       case 'verifyAdmin':
         // 관리자 로그인 확인. 비밀번호가 주소에 남지 않도록 POST로만 받는다.
+        if (loginLocked_()) {
+          result = { success: false, message: '로그인 시도가 많아 잠겼습니다. 10분 뒤 다시 시도해 주세요.' };
+          break;
+        }
         result = verifyPassword(data.password)
           ? { success: true }
           : { success: false, message: '비밀번호가 올바르지 않습니다.' };
@@ -976,6 +980,11 @@ function getConfigInternal() {
 // 인증 헬퍼
 // ============================================================
 
+/** 비밀번호를 10분에 10번 틀렸는지 확인한다. Apps Script는 접속자 IP를 알 수 없어 전체 공용으로 센다. */
+function loginLocked_() {
+  return Number(CacheService.getScriptCache().get('auth_failed') || 0) >= 10;
+}
+
 /**
  * 비밀번호 검증
  * SHA-256 해시로 비교
@@ -985,9 +994,9 @@ function verifyPassword(password) {
 
   try {
     // 공개 주소로 비밀번호를 계속 대입해 보는 시도를 막는다. 10분에 10번 틀리면 10분 동안 잠긴다.
+    if (loginLocked_()) return false;
     var cache = CacheService.getScriptCache();
     var failed = Number(cache.get('auth_failed') || 0);
-    if (failed >= 10) return false;
 
     // Script Properties를 먼저 본다. 시트 값은 예전 설치와의 호환을 위해서만 읽는다.
     var storedHash = PropertiesService.getScriptProperties().getProperty('ADMIN_PASSWORD_HASH');
